@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"bitbucket.org/bestchai/dinv/govec"
+
 	"github.com/hashicorp/go-msgpack/codec"
 )
 
@@ -37,7 +39,6 @@ var (
 )
 
 /*
-
 NetworkTransport provides a network based transport that can be
 used to communicate with Raft on remote machines. It requires
 an underlying stream layer to provide a stream abstraction, which can
@@ -76,6 +77,7 @@ type NetworkTransport struct {
 
 	timeout      time.Duration
 	TimeoutScale int
+	goVecLogger  *govec.GoLog //dinvadded
 }
 
 // StreamLayer is used with the NetworkTransport to provide
@@ -134,6 +136,7 @@ func NewNetworkTransport(
 		stream:       stream,
 		timeout:      timeout,
 		TimeoutScale: DefaultTimeoutScale,
+		goVecLogger:  govec.Initialize(stream.Addr().String(), stream.Addr().String()+".log"), //dinvadded
 	}
 	go trans.listen()
 	return trans
@@ -279,11 +282,13 @@ func (n *NetworkTransport) genericRPC(target string, rpcType uint8, args interfa
 	}
 
 	// Send the RPC
+	injectClock(conn.w, n.goVecLogger) //dinvadded
 	if err := sendRPC(conn, rpcType, args); err != nil {
 		return err
 	}
 
 	// Decode the response
+	extractClock(conn.r, n.goVecLogger) //dinvadded
 	canReturn, err := decodeResponse(conn, resp)
 	if canReturn {
 		n.returnConn(conn)
@@ -310,6 +315,7 @@ func (n *NetworkTransport) InstallSnapshot(target string, args *InstallSnapshotR
 	}
 
 	// Send the RPC
+	injectClock(conn.w, n.goVecLogger) //dinvadded
 	if err := sendRPC(conn, rpcInstallSnapshot, args); err != nil {
 		return err
 	}
@@ -323,8 +329,8 @@ func (n *NetworkTransport) InstallSnapshot(target string, args *InstallSnapshotR
 	if err := conn.w.Flush(); err != nil {
 		return err
 	}
-
 	// Decode the response, do not return conn
+	extractClock(conn.r, n.goVecLogger) //dinvadded
 	_, err = decodeResponse(conn, resp)
 	return err
 }
@@ -367,6 +373,8 @@ func (n *NetworkTransport) handleConn(conn net.Conn) {
 	enc := codec.NewEncoder(w, &codec.MsgpackHandle{})
 
 	for {
+		extractClock(r, n.goVecLogger) //DinvAdded
+		injectClock(w, n.goVecLogger)  //DinvAdded
 		if err := n.handleCommand(r, dec, enc); err != nil {
 			if err != io.EOF {
 				n.logger.Printf("[ERR] raft-net: Failed to decode incoming command: %v", err)
@@ -382,6 +390,7 @@ func (n *NetworkTransport) handleConn(conn net.Conn) {
 
 // handleCommand is used to decode and dispatch a single command.
 func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *codec.Encoder) error {
+
 	// Get the rpc type
 	rpcType, err := r.ReadByte()
 	if err != nil {
@@ -473,8 +482,8 @@ RESP:
 
 // decodeResponse is used to decode an RPC response and return the conn.
 func decodeResponse(conn *netConn, resp interface{}) (bool, error) {
-	// Decode the error if any
 	var rpcError string
+	// Decode the error if any
 	if err := conn.dec.Decode(&rpcError); err != nil {
 		conn.Release()
 		return false, err
@@ -495,6 +504,7 @@ func decodeResponse(conn *netConn, resp interface{}) (bool, error) {
 
 // sendRPC is used to encode and send the RPC.
 func sendRPC(conn *netConn, rpcType uint8, args interface{}) error {
+
 	// Write the request type
 	if err := conn.w.WriteByte(rpcType); err != nil {
 		conn.Release()
@@ -540,6 +550,7 @@ func (n *netPipeline) decodeResponses() {
 				n.conn.conn.SetReadDeadline(time.Now().Add(timeout))
 			}
 
+			extractClock(n.conn.r, n.trans.goVecLogger) //dinvadded
 			_, err := decodeResponse(n.conn, future.resp)
 			future.respond(err)
 			select {
@@ -569,10 +580,10 @@ func (n *netPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntr
 	}
 
 	// Send the RPC
+	injectClock(n.conn.w, n.trans.goVecLogger) //dinvadded
 	if err := sendRPC(n.conn, rpcAppendEntries, future.args); err != nil {
 		return nil, err
 	}
-
 	// Hand-off for decoding, this can also cause back-pressure
 	// to prevent too many inflight requests
 	select {
@@ -603,3 +614,43 @@ func (n *netPipeline) Close() error {
 	close(n.shutdownCh)
 	return nil
 }
+
+//-------------------DinvAddend---------------------/
+func injectClock(w *bufio.Writer, goVecLogger *govec.GoLog) error {
+	//dinvadded
+	if _, err := w.Write(goVecLogger.PrepareSend("SendingRPC", nil)); err != nil {
+		return err
+	}
+	var blockByte byte = 0xfe
+	if err := w.WriteByte(blockByte); err != nil {
+		return err
+	}
+	return nil
+}
+
+func extractClock(r *bufio.Reader, goVecLogger *govec.GoLog) error {
+	buffer := make([]byte, 0)
+	buffDone := false
+	for !buffDone {
+		_, err := r.Peek(1)
+		if err != nil {
+			continue
+		}
+		//fmt.Print("R")
+		bite, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+
+		//print(bite, " ")
+		if bite == 0xfe {
+			buffDone = true
+		} else {
+			buffer = append(buffer, bite)
+		}
+	}
+	goVecLogger.UnpackReceive("Received", buffer[0:])
+	return nil
+}
+
+//-------------------/DinvAddend---------------------/

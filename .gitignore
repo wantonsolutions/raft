@@ -22,4 +22,4 @@ _testmain.go
 *.exe
 *.test
 
-*.sw[po]
+*.sw[a-z]

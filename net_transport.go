@@ -629,14 +629,8 @@ func injectClock(w *bufio.Writer, goVecLogger *govec.GoLog) error {
 }
 
 func extractClock(r *bufio.Reader, goVecLogger *govec.GoLog) error {
-	buffer := make([]byte, 0)
-	buffDone := false
+	buffer, buffDone := make([]byte, 0), false
 	for !buffDone {
-		_, err := r.Peek(1)
-		if err != nil {
-			continue
-		}
-		//fmt.Print("R")
 		bite, err := r.ReadByte()
 		if err != nil {
 			return err
